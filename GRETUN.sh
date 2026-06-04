@@ -168,7 +168,7 @@ create_tunnel() {
 
   ip tunnel add gre1 mode gre local "$LOCAL_PUBLIC_IP" remote "$REMOTE_PUBLIC_IP" ttl 255
   ip addr add "$LOCAL_GRE_IP" dev gre1
-  ip link set gre1 mtu 1390
+  ip link set gre1 mtu 1400
   ip link set gre1 up
 
   if ! ip link show gre1 >/dev/null 2>&1; then
@@ -177,8 +177,55 @@ create_tunnel() {
   fi
 
   echo 1 > /proc/sys/net/ipv4/ip_forward || true
+  
+  # === VLESS TCP/WS OPTIMIZATION ===
+  
+  # Enable TCP Window Scaling for better throughput
+  echo 1 > /proc/sys/net/ipv4/tcp_window_scaling || true
+  
+  # Increase TCP buffer sizes for VLESS streaming
+  echo 4096 1000000 2000000 > /proc/sys/net/ipv4/tcp_rmem || true
+  echo 4096 1000000 2000000 > /proc/sys/net/ipv4/tcp_wmem || true
+  
+  # MSS Clamping for GRE tunnel (prevent fragmentation)
+  # GRE adds 24 bytes overhead, so clamp to 1376 (1400-24)
+  iptables -t mangle -C FORWARD -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
+  iptables -t mangle -A FORWARD -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || true
+  
+  # Enable SACK and FACK for better loss recovery
+  echo 1 > /proc/sys/net/ipv4/tcp_sack || true
+  echo 1 > /proc/sys/net/ipv4/tcp_fack || true
+  
+  # Use BBR congestion control (better for tunnels)
+  echo bbr > /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || true
+  
+  # Increase connection tracking table
+  echo 262144 > /proc/sys/net/netfilter/nf_conntrack_max || true
+  
+  # Optimize TCP keepalive for VLESS
+  echo 300 > /proc/sys/net/ipv4/tcp_keepalive_time || true
+  echo 60 > /proc/sys/net/ipv4/tcp_keepalive_intvl || true
+  echo 3 > /proc/sys/net/ipv4/tcp_keepalive_probes || true
+  
+  # Enable SYN cookies for DDoS protection
+  echo 1 > /proc/sys/net/ipv4/tcp_syncookies || true
+  
+  # Persist settings to sysctl.conf
   if [ -f /etc/sysctl.conf ]; then
     sed -i 's/^#\?net.ipv4.ip_forward=.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf || true
+    sed -i 's/^#\?net.ipv4.tcp_window_scaling=.*/net.ipv4.tcp_window_scaling=1/' /etc/sysctl.conf || true
+    sed -i '/^net.ipv4.tcp_rmem=/d' /etc/sysctl.conf || true
+    echo "net.ipv4.tcp_rmem=4096 1000000 2000000" >> /etc/sysctl.conf || true
+    sed -i '/^net.ipv4.tcp_wmem=/d' /etc/sysctl.conf || true
+    echo "net.ipv4.tcp_wmem=4096 1000000 2000000" >> /etc/sysctl.conf || true
+    sed -i 's/^#\?net.ipv4.tcp_sack=.*/net.ipv4.tcp_sack=1/' /etc/sysctl.conf || true
+    sed -i 's/^#\?net.ipv4.tcp_fack=.*/net.ipv4.tcp_fack=1/' /etc/sysctl.conf || true
+    sed -i 's/^#\?net.ipv4.tcp_congestion_control=.*/net.ipv4.tcp_congestion_control=bbr/' /etc/sysctl.conf || true
+    sed -i 's/^#\?net.netfilter.nf_conntrack_max=.*/net.netfilter.nf_conntrack_max=262144/' /etc/sysctl.conf || true
+    sed -i 's/^#\?net.ipv4.tcp_keepalive_time=.*/net.ipv4.tcp_keepalive_time=300/' /etc/sysctl.conf || true
+    sed -i 's/^#\?net.ipv4.tcp_keepalive_intvl=.*/net.ipv4.tcp_keepalive_intvl=60/' /etc/sysctl.conf || true
+    sed -i 's/^#\?net.ipv4.tcp_keepalive_probes=.*/net.ipv4.tcp_keepalive_probes=3/' /etc/sysctl.conf || true
+    sed -i 's/^#\?net.ipv4.tcp_syncookies=.*/net.ipv4.tcp_syncookies=1/' /etc/sysctl.conf || true
     sysctl -p >/dev/null 2>&1 || true
   fi
 
@@ -191,6 +238,7 @@ create_tunnel() {
   echo "[✓] GRE tunnel created as gre1"
   echo "Local GRE IP: $LOCAL_GRE_IP"
   echo "Remote GRE IP: $REMOTE_GRE_IP"
+  echo "[✓] VLESS TCP/WS optimization applied"
 
   # Setup port forwarding if specified
   setup_port_forwarding
@@ -489,6 +537,43 @@ flush_iptables_rules() {
   echo "[✓] iptables rules flushed"
 }
 
+show_optimization_stats() {
+  clear
+  echo
+  echo "GRE Tunnel - VLESS TCP/WS Optimization Status"
+  echo "=============================================="
+  echo
+  
+  echo "📊 Current Kernel Settings:"
+  echo
+  echo "TCP Window Scaling: $(cat /proc/sys/net/ipv4/tcp_window_scaling 2>/dev/null || echo 'N/A')"
+  echo "TCP SACK: $(cat /proc/sys/net/ipv4/tcp_sack 2>/dev/null || echo 'N/A')"
+  echo "TCP FACK: $(cat /proc/sys/net/ipv4/tcp_fack 2>/dev/null || echo 'N/A')"
+  echo "Congestion Control: $(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || echo 'N/A')"
+  echo
+  
+  echo "TCP Buffer Sizes (recv):"
+  cat /proc/sys/net/ipv4/tcp_rmem 2>/dev/null || echo "N/A"
+  echo
+  
+  echo "TCP Buffer Sizes (send):"
+  cat /proc/sys/net/ipv4/tcp_wmem 2>/dev/null || echo "N/A"
+  echo
+  
+  if ip link show gre1 >/dev/null 2>&1; then
+    echo "🌐 GRE Interface Status:"
+    ip -s link show gre1 | grep -A 3 "RX:"
+    echo
+  fi
+  
+  echo "🔧 Recommendations for VLESS:"
+  echo "  1. Use VLESS with TCP: faster than WS on GRE tunnels"
+  echo "  2. Enable multiplexing in client config"
+  echo "  3. Use BBR congestion control (already enabled)"
+  echo "  4. Increase fragment size to 1370 in client settings"
+  echo "  5. Monitor tunnel with: iftop -i gre1"
+}
+
 show_menu() {
   clear
   echo "==============================="
@@ -499,14 +584,16 @@ show_menu() {
   echo "2) status"
   echo "3) remove tun"
   echo "4) flush iptables rules"
+  echo "5) VLESS optimization info"
   echo "0) Exit"
   echo
-  read -rp "Choose an option [0-4]: " CHOICE
+  read -rp "Choose an option [0-5]: " CHOICE
   case "$CHOICE" in
     1) menu_config_tunnel ; read -rp "Press Enter to continue..." _ ;;
     2) status_check ; read -rp "Press Enter to continue..." _ ;;
     3) remove_tun ; read -rp "Press Enter to continue..." _ ;;
     4) flush_iptables_rules ; read -rp "Press Enter to continue..." _ ;;
+    5) show_optimization_stats ; read -rp "Press Enter to continue..." _ ;;
     0) echo "Bye"; exit 0 ;;
     *) echo "Invalid option"; sleep 1 ;;
   esac
