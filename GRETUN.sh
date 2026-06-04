@@ -598,9 +598,6 @@ show_menu() {
     *) echo "Invalid option"; sleep 1 ;;
   esac
 }
-    *) echo "Invalid option"; sleep 1 ;;
-  esac
-}
 
 ### Script entry
 if [[ "${1:-}" == "--service" ]]; then
