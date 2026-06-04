@@ -86,20 +86,30 @@ setup_port_forwarding() {
       continue
     fi
     
-    # Forward TCP traffic
-    iptables -t nat -C PREROUTING -i "$PRIMARY_NIC" -p tcp --dport "$port" -j DNAT --to-destination "$gre_local_ip" 2>/dev/null || \
-    iptables -t nat -A PREROUTING -i "$PRIMARY_NIC" -p tcp --dport "$port" -j DNAT --to-destination "$gre_local_ip"
+    # Forward TCP traffic to GRE tunnel with port number
+    iptables -t nat -A PREROUTING -i "$PRIMARY_NIC" -p tcp --dport "$port" -j DNAT --to-destination "$gre_local_ip:$port" 2>/dev/null || true
     
-    # Forward UDP traffic
-    iptables -t nat -C PREROUTING -i "$PRIMARY_NIC" -p udp --dport "$port" -j DNAT --to-destination "$gre_local_ip" 2>/dev/null || \
-    iptables -t nat -A PREROUTING -i "$PRIMARY_NIC" -p udp --dport "$port" -j DNAT --to-destination "$gre_local_ip"
-    
-    # Masquerade for return traffic
-    iptables -t nat -C POSTROUTING -o gre1 -j MASQUERADE 2>/dev/null || \
-    iptables -t nat -A POSTROUTING -o gre1 -j MASQUERADE
+    # Forward UDP traffic to GRE tunnel with port number
+    iptables -t nat -A PREROUTING -i "$PRIMARY_NIC" -p udp --dport "$port" -j DNAT --to-destination "$gre_local_ip:$port" 2>/dev/null || true
     
     echo "  ✓ Port $port forwarded"
   done
+  
+  # Create multiport rules for FORWARD
+  ports_list=$(IFS=,; echo "${PORT_ARRAY[*]}")
+  ports_list="${ports_list//[[:space:]]/}"  # Remove whitespace
+  
+  # Allow forwarding from primary NIC to GRE tunnel
+  iptables -A FORWARD -i "$PRIMARY_NIC" -o gre1 -p tcp -m multiport --dports "$ports_list" -d "$gre_local_ip" -j ACCEPT 2>/dev/null || true
+  iptables -A FORWARD -i "$PRIMARY_NIC" -o gre1 -p udp -m multiport --dports "$ports_list" -d "$gre_local_ip" -j ACCEPT 2>/dev/null || true
+  
+  # Allow return traffic from GRE tunnel to primary NIC
+  iptables -A FORWARD -i gre1 -o "$PRIMARY_NIC" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+  
+  # Masquerade for return traffic
+  iptables -t nat -A POSTROUTING -o gre1 -j MASQUERADE 2>/dev/null || true
+  
+  echo "[✓] Port forwarding rules applied"
 }
 
 save_config() {
@@ -411,6 +421,74 @@ service_start() {
   fi
 }
 
+flush_iptables_rules() {
+  clear
+  echo
+  echo "Flush iptables Port Forwarding Rules"
+  echo
+  
+  if [ -z "$FORWARDED_PORTS" ] || [ -z "$PRIMARY_NIC" ]; then
+    # Try to load from config
+    if ! load_config; then
+      echo "No saved configuration. Cannot determine NIC and ports."
+      return 1
+    fi
+  fi
+  
+  if [ -z "$FORWARDED_PORTS" ] || [ -z "$PRIMARY_NIC" ]; then
+    echo "No forwarded ports or NIC configured."
+    return 0
+  fi
+  
+  echo "This will remove all iptables forwarding rules for:"
+  echo "  NIC: $PRIMARY_NIC"
+  echo "  Ports: $FORWARDED_PORTS"
+  echo
+  
+  read -rp "Continue? [y/N]: " confirm
+  case "$confirm" in
+    [Yy]*) ;;
+    *) echo "Cancelled."; return ;;
+  esac
+  
+  echo "[*] Flushing iptables rules..."
+  
+  # Get GRE IP
+  local gre_local_ip="10.10.10.1"
+  if [ "$ROLE" == "2" ]; then
+    gre_local_ip="10.10.10.2"
+  fi
+  
+  # Parse ports
+  IFS=',' read -ra PORT_ARRAY <<< "$FORWARDED_PORTS"
+  
+  # Remove PREROUTING rules for each port
+  for port in "${PORT_ARRAY[@]}"; do
+    port="${port//[[:space:]]/}"
+    if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+      continue
+    fi
+    
+    iptables -t nat -D PREROUTING -i "$PRIMARY_NIC" -p tcp --dport "$port" -j DNAT --to-destination "$gre_local_ip:$port" 2>/dev/null || true
+    iptables -t nat -D PREROUTING -i "$PRIMARY_NIC" -p udp --dport "$port" -j DNAT --to-destination "$gre_local_ip:$port" 2>/dev/null || true
+  done
+  
+  # Remove multiport rules from FORWARD
+  ports_list=$(IFS=,; echo "${PORT_ARRAY[*]}")
+  ports_list="${ports_list//[[:space:]]/}"
+  
+  iptables -D FORWARD -i "$PRIMARY_NIC" -o gre1 -p tcp -m multiport --dports "$ports_list" -d "$gre_local_ip" -j ACCEPT 2>/dev/null || true
+  iptables -D FORWARD -i "$PRIMARY_NIC" -o gre1 -p udp -m multiport --dports "$ports_list" -d "$gre_local_ip" -j ACCEPT 2>/dev/null || true
+  
+  # Remove return traffic rule
+  iptables -D FORWARD -i gre1 -o "$PRIMARY_NIC" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+  
+  # Remove MASQUERADE rule
+  iptables -t nat -D POSTROUTING -o gre1 -j MASQUERADE 2>/dev/null || true
+  
+  echo "[✓] iptables rules flushed"
+}
+
 show_menu() {
   clear
   echo "==============================="
@@ -420,14 +498,19 @@ show_menu() {
   echo "1) config tunnel"
   echo "2) status"
   echo "3) remove tun"
+  echo "4) flush iptables rules"
   echo "0) Exit"
   echo
-  read -rp "Choose an option [0-3]: " CHOICE
+  read -rp "Choose an option [0-4]: " CHOICE
   case "$CHOICE" in
     1) menu_config_tunnel ; read -rp "Press Enter to continue..." _ ;;
     2) status_check ; read -rp "Press Enter to continue..." _ ;;
     3) remove_tun ; read -rp "Press Enter to continue..." _ ;;
+    4) flush_iptables_rules ; read -rp "Press Enter to continue..." _ ;;
     0) echo "Bye"; exit 0 ;;
+    *) echo "Invalid option"; sleep 1 ;;
+  esac
+}
     *) echo "Invalid option"; sleep 1 ;;
   esac
 }
