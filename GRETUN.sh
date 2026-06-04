@@ -222,10 +222,6 @@ menu_config_tunnel() {
     return
   fi
 
-  # Select primary network interface
-  echo
-  select_primary_nic || return
-
   LOCAL_PUBLIC_IP="${LOCAL_PUBLIC_IP:-$(detect_local_public_ip)}"
   echo "Local Public IP detected: $LOCAL_PUBLIC_IP"
   read -rp "Enter REMOTE server Public IPv4: " REMOTE_PUBLIC_IP
@@ -234,8 +230,15 @@ menu_config_tunnel() {
     return
   fi
 
-  # Input forwarded ports
-  input_forwarded_ports
+  # Only ask for port forwarding on Iran server
+  if [ "$ROLE" == "1" ]; then
+    echo
+    select_primary_nic || return
+    input_forwarded_ports
+  else
+    PRIMARY_NIC=""
+    FORWARDED_PORTS=""
+  fi
 
   # call create_tunnel interactively (will handle save+install flow)
   create_tunnel 1 || echo "create_tunnel failed"
