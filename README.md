@@ -3,7 +3,7 @@
 
 
 ```bash
-bash <(curl -Ls --ipv4 https://raw.githubusercontent.com/kamekazie98/GRE-TUN/refs/heads/main/GRETUN.sh)
+bash <(curl -Ls --ipv4 https://raw.githubusercontent.com/kamikazie98/GRE-TUN/refs/heads/main/GRETUN.sh)
 ```
 
 📌 ترتیب اجرا:
