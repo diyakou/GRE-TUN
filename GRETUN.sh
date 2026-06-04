@@ -17,6 +17,91 @@ detect_local_public_ip() {
   ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}'
 }
 
+select_primary_nic() {
+  echo "Available Network Interfaces:"
+  echo
+  mapfile -t nics < <(ip -o link show | awk -F': ' '{print $2}' | grep -v '^lo$' || true)
+  
+  if [ ${#nics[@]} -eq 0 ]; then
+    echo "No network interfaces found!"
+    return 1
+  fi
+  
+  for i in "${!nics[@]}"; do
+    echo "$((i+1))) ${nics[$i]}"
+  done
+  
+  echo
+  read -rp "Select primary network interface [1-${#nics[@]}]: " nic_choice
+  
+  if ! [[ "$nic_choice" =~ ^[0-9]+$ ]] || [ "$nic_choice" -lt 1 ] || [ "$nic_choice" -gt ${#nics[@]} ]; then
+    echo "Invalid selection"
+    return 1
+  fi
+  
+  PRIMARY_NIC="${nics[$((nic_choice-1))]}"
+  echo "Selected: $PRIMARY_NIC"
+}
+
+get_nic_ip() {
+  local nic="$1"
+  ip -4 addr show dev "$nic" 2>/dev/null | awk '/inet / {print $2; exit}' | cut -d'/' -f1
+}
+
+input_forwarded_ports() {
+  echo
+  echo "Enter ports to forward (comma-separated, e.g., 2020,2021,2022):"
+  read -rp "Forwarded ports: " FORWARDED_PORTS
+  
+  if [ -z "$FORWARDED_PORTS" ]; then
+    echo "No ports specified"
+    FORWARDED_PORTS=""
+    return
+  fi
+  
+  echo "Forwarded ports will be: $FORWARDED_PORTS"
+}
+
+setup_port_forwarding() {
+  if [ -z "$FORWARDED_PORTS" ] || [ -z "$PRIMARY_NIC" ]; then
+    return 0
+  fi
+  
+  echo "[*] Setting up port forwarding from $PRIMARY_NIC to GRE tunnel..."
+  
+  # Get the IP of the primary NIC (local GRE IP to forward to)
+  local gre_local_ip="10.10.10.1"
+  if [ "$ROLE" == "2" ]; then
+    gre_local_ip="10.10.10.2"
+  fi
+  
+  # Parse ports and set up forwarding
+  IFS=',' read -ra PORT_ARRAY <<< "$FORWARDED_PORTS"
+  
+  for port in "${PORT_ARRAY[@]}"; do
+    port="${port//[[:space:]]/}"  # Remove whitespace
+    
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+      echo "  ⚠ Skipping invalid port: $port"
+      continue
+    fi
+    
+    # Forward TCP traffic
+    iptables -t nat -C PREROUTING -i "$PRIMARY_NIC" -p tcp --dport "$port" -j DNAT --to-destination "$gre_local_ip" 2>/dev/null || \
+    iptables -t nat -A PREROUTING -i "$PRIMARY_NIC" -p tcp --dport "$port" -j DNAT --to-destination "$gre_local_ip"
+    
+    # Forward UDP traffic
+    iptables -t nat -C PREROUTING -i "$PRIMARY_NIC" -p udp --dport "$port" -j DNAT --to-destination "$gre_local_ip" 2>/dev/null || \
+    iptables -t nat -A PREROUTING -i "$PRIMARY_NIC" -p udp --dport "$port" -j DNAT --to-destination "$gre_local_ip"
+    
+    # Masquerade for return traffic
+    iptables -t nat -C POSTROUTING -o gre1 -j MASQUERADE 2>/dev/null || \
+    iptables -t nat -A POSTROUTING -o gre1 -j MASQUERADE
+    
+    echo "  ✓ Port $port forwarded"
+  done
+}
+
 save_config() {
   cat > "$CONF_FILE" <<EOF
 ROLE="$ROLE"
@@ -24,6 +109,8 @@ LOCAL_PUBLIC_IP="$LOCAL_PUBLIC_IP"
 REMOTE_PUBLIC_IP="$REMOTE_PUBLIC_IP"
 LOCAL_GRE_IP="$LOCAL_GRE_IP"
 REMOTE_GRE_IP="$REMOTE_GRE_IP"
+PRIMARY_NIC="${PRIMARY_NIC:-}"
+FORWARDED_PORTS="${FORWARDED_PORTS:-}"
 EOF
   chmod 600 "$CONF_FILE"
   echo "Saved configuration to $CONF_FILE"
@@ -95,6 +182,9 @@ create_tunnel() {
   echo "Local GRE IP: $LOCAL_GRE_IP"
   echo "Remote GRE IP: $REMOTE_GRE_IP"
 
+  # Setup port forwarding if specified
+  setup_port_forwarding
+
   # If called interactively from the menu, offer to save config and install service
   if [ "$interactive" -eq 1 ]; then
     read -rp "Save this configuration to $CONF_FILE? [y/N]: " yn
@@ -132,6 +222,10 @@ menu_config_tunnel() {
     return
   fi
 
+  # Select primary network interface
+  echo
+  select_primary_nic || return
+
   LOCAL_PUBLIC_IP="${LOCAL_PUBLIC_IP:-$(detect_local_public_ip)}"
   echo "Local Public IP detected: $LOCAL_PUBLIC_IP"
   read -rp "Enter REMOTE server Public IPv4: " REMOTE_PUBLIC_IP
@@ -139,6 +233,9 @@ menu_config_tunnel() {
     echo "Remote IP cannot be empty"
     return
   fi
+
+  # Input forwarded ports
+  input_forwarded_ports
 
   # call create_tunnel interactively (will handle save+install flow)
   create_tunnel 1 || echo "create_tunnel failed"
