@@ -184,20 +184,36 @@ create_tunnel() {
   echo 1 > /proc/sys/net/ipv4/tcp_window_scaling || true
   
   # Increase TCP buffer sizes for VLESS streaming
-  echo 4096 1000000 2000000 > /proc/sys/net/ipv4/tcp_rmem || true
-  echo 4096 1000000 2000000 > /proc/sys/net/ipv4/tcp_wmem || true
+  # Balanced send/receive for symmetric bandwidth
+  echo 8192 1000000 4000000 > /proc/sys/net/ipv4/tcp_rmem || true
+  echo 8192 1000000 4000000 > /proc/sys/net/ipv4/tcp_wmem || true
+  
+  # Increase socket send buffer (critical for upload)
+  echo 16777216 > /proc/sys/net/core/wmem_max || true
+  echo 16777216 > /proc/sys/net/core/rmem_max || true
+  echo 262144 > /proc/sys/net/core/wmem_default || true
+  echo 262144 > /proc/sys/net/core/rmem_default || true
+  
+  # Increase TX queue length to prevent upload drops
+  ip link set gre1 txqueuelen 1000
   
   # MSS Clamping for GRE tunnel (prevent fragmentation)
   # GRE adds 24 bytes overhead, so clamp to 1376 (1400-24)
   iptables -t mangle -C FORWARD -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
   iptables -t mangle -A FORWARD -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu || true
   
-  # Enable SACK and FACK for better loss recovery
+  # Enable SACK and FACK for better loss recovery (crucial for upload)
   echo 1 > /proc/sys/net/ipv4/tcp_sack || true
   echo 1 > /proc/sys/net/ipv4/tcp_fack || true
   
-  # Use BBR congestion control (better for tunnels)
+  # Use BBR congestion control (better for asymmetric upload)
   echo bbr > /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || true
+  
+  # Enable ECN for better congestion detection
+  echo 1 > /proc/sys/net/ipv4/tcp_ecn || true
+  
+  # Disable Delayed ACK to improve upload responsiveness
+  echo 0 > /proc/sys/net/ipv4/tcp_delack_min || true
   
   # Increase connection tracking table
   echo 262144 > /proc/sys/net/netfilter/nf_conntrack_max || true
@@ -210,22 +226,41 @@ create_tunnel() {
   # Enable SYN cookies for DDoS protection
   echo 1 > /proc/sys/net/ipv4/tcp_syncookies || true
   
+  # Disable reverse path filtering that might block upload
+  echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter || true
+  echo 0 > /proc/sys/net/ipv4/conf/default/rp_filter || true
+  if [ -d /proc/sys/net/ipv4/conf/gre1 ]; then
+    echo 0 > /proc/sys/net/ipv4/conf/gre1/rp_filter || true
+  fi
+  
   # Persist settings to sysctl.conf
   if [ -f /etc/sysctl.conf ]; then
     sed -i 's/^#\?net.ipv4.ip_forward=.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf || true
     sed -i 's/^#\?net.ipv4.tcp_window_scaling=.*/net.ipv4.tcp_window_scaling=1/' /etc/sysctl.conf || true
     sed -i '/^net.ipv4.tcp_rmem=/d' /etc/sysctl.conf || true
-    echo "net.ipv4.tcp_rmem=4096 1000000 2000000" >> /etc/sysctl.conf || true
+    echo "net.ipv4.tcp_rmem=8192 1000000 4000000" >> /etc/sysctl.conf || true
     sed -i '/^net.ipv4.tcp_wmem=/d' /etc/sysctl.conf || true
-    echo "net.ipv4.tcp_wmem=4096 1000000 2000000" >> /etc/sysctl.conf || true
+    echo "net.ipv4.tcp_wmem=8192 1000000 4000000" >> /etc/sysctl.conf || true
+    sed -i '/^net.core.wmem_max=/d' /etc/sysctl.conf || true
+    echo "net.core.wmem_max=16777216" >> /etc/sysctl.conf || true
+    sed -i '/^net.core.rmem_max=/d' /etc/sysctl.conf || true
+    echo "net.core.rmem_max=16777216" >> /etc/sysctl.conf || true
+    sed -i '/^net.core.wmem_default=/d' /etc/sysctl.conf || true
+    echo "net.core.wmem_default=262144" >> /etc/sysctl.conf || true
+    sed -i '/^net.core.rmem_default=/d' /etc/sysctl.conf || true
+    echo "net.core.rmem_default=262144" >> /etc/sysctl.conf || true
     sed -i 's/^#\?net.ipv4.tcp_sack=.*/net.ipv4.tcp_sack=1/' /etc/sysctl.conf || true
     sed -i 's/^#\?net.ipv4.tcp_fack=.*/net.ipv4.tcp_fack=1/' /etc/sysctl.conf || true
+    sed -i 's/^#\?net.ipv4.tcp_ecn=.*/net.ipv4.tcp_ecn=1/' /etc/sysctl.conf || true
+    sed -i 's/^#\?net.ipv4.tcp_delack_min=.*/net.ipv4.tcp_delack_min=0/' /etc/sysctl.conf || true
     sed -i 's/^#\?net.ipv4.tcp_congestion_control=.*/net.ipv4.tcp_congestion_control=bbr/' /etc/sysctl.conf || true
     sed -i 's/^#\?net.netfilter.nf_conntrack_max=.*/net.netfilter.nf_conntrack_max=262144/' /etc/sysctl.conf || true
     sed -i 's/^#\?net.ipv4.tcp_keepalive_time=.*/net.ipv4.tcp_keepalive_time=300/' /etc/sysctl.conf || true
     sed -i 's/^#\?net.ipv4.tcp_keepalive_intvl=.*/net.ipv4.tcp_keepalive_intvl=60/' /etc/sysctl.conf || true
     sed -i 's/^#\?net.ipv4.tcp_keepalive_probes=.*/net.ipv4.tcp_keepalive_probes=3/' /etc/sysctl.conf || true
     sed -i 's/^#\?net.ipv4.tcp_syncookies=.*/net.ipv4.tcp_syncookies=1/' /etc/sysctl.conf || true
+    sed -i 's/^#\?net.ipv4.conf.all.rp_filter=.*/net.ipv4.conf.all.rp_filter=0/' /etc/sysctl.conf || true
+    sed -i 's/^#\?net.ipv4.conf.default.rp_filter=.*/net.ipv4.conf.default.rp_filter=0/' /etc/sysctl.conf || true
     sysctl -p >/dev/null 2>&1 || true
   fi
 
@@ -549,29 +584,44 @@ show_optimization_stats() {
   echo "TCP Window Scaling: $(cat /proc/sys/net/ipv4/tcp_window_scaling 2>/dev/null || echo 'N/A')"
   echo "TCP SACK: $(cat /proc/sys/net/ipv4/tcp_sack 2>/dev/null || echo 'N/A')"
   echo "TCP FACK: $(cat /proc/sys/net/ipv4/tcp_fack 2>/dev/null || echo 'N/A')"
+  echo "TCP ECN: $(cat /proc/sys/net/ipv4/tcp_ecn 2>/dev/null || echo 'N/A')"
+  echo "Reverse Path Filter (rp_filter): $(cat /proc/sys/net/ipv4/conf/all/rp_filter 2>/dev/null || echo 'N/A')"
   echo "Congestion Control: $(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || echo 'N/A')"
   echo
   
-  echo "TCP Buffer Sizes (recv):"
+  echo "TCP Buffer Sizes (recv - rmem):"
   cat /proc/sys/net/ipv4/tcp_rmem 2>/dev/null || echo "N/A"
   echo
   
-  echo "TCP Buffer Sizes (send):"
+  echo "TCP Buffer Sizes (send - wmem):"
   cat /proc/sys/net/ipv4/tcp_wmem 2>/dev/null || echo "N/A"
+  echo
+  
+  echo "Socket Max Send Buffer (wmem_max):"
+  cat /proc/sys/net/core/wmem_max 2>/dev/null || echo "N/A"
+  echo
+  
+  echo "Socket Default Send Buffer (wmem_default):"
+  cat /proc/sys/net/core/wmem_default 2>/dev/null || echo "N/A"
   echo
   
   if ip link show gre1 >/dev/null 2>&1; then
     echo "🌐 GRE Interface Status:"
     ip -s link show gre1 | grep -A 3 "RX:"
     echo
+    echo "GRE Interface TX Queue Length:"
+    ip link show gre1 | grep qlen || echo "N/A"
+    echo
   fi
   
-  echo "🔧 Recommendations for VLESS:"
-  echo "  1. Use VLESS with TCP: faster than WS on GRE tunnels"
-  echo "  2. Enable multiplexing in client config"
-  echo "  3. Use BBR congestion control (already enabled)"
-  echo "  4. Increase fragment size to 1370 in client settings"
-  echo "  5. Monitor tunnel with: iftop -i gre1"
+  echo "🔧 Recommendations for VLESS with Upload Issues:"
+  echo "  1. Use VLESS with TCP: better for asymmetric connections"
+  echo "  2. Enable multiplexing in client (16+ connections)"
+  echo "  3. Test upload speed: iperf3 -c SERVER -P 8 -R"
+  echo "  4. Check ISP throttling on upload (might need VPN)"
+  echo "  5. Monitor: iftop -i gre1 or nethogs"
+  echo "  6. If still slow, try multiple parallel tunnels"
+  echo "  7. Disable rp_filter helps upload on some networks"
 }
 
 show_menu() {
